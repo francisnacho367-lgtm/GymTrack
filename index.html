@@ -340,6 +340,24 @@ h2,h3,h4{font-family:"Barlow Condensed",sans-serif;text-transform:uppercase;font
   line-height:1.7;padding:12px;border:1px solid var(--line);border-radius:var(--radius)}
 .sync b{color:var(--muted);font-weight:500}
 
+.gate{position:fixed;inset:0;background:var(--iron);z-index:50;display:none;
+  align-items:center;justify-content:center;padding:24px}
+.gate.on{display:flex}
+.gate-card{max-width:360px;width:100%}
+.gate-card h2{font-size:34px;margin:8px 0 4px}
+.gate-card p{color:var(--muted);font-size:14px;line-height:1.6;margin-bottom:18px}
+.gate-status{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--beat);
+  margin-top:14px;min-height:1em;line-height:1.6}
+.gate-status.err{color:#D98A84}
+body.gated{overflow:hidden}
+body.gated .wrap,body.gated .savebar,body.gated .timer{display:none}
+.account-row{display:flex;align-items:center;gap:10px;background:var(--surface-2);
+  border:1px solid var(--line);border-radius:var(--radius);padding:12px 13px;margin-bottom:16px}
+.account-row .tt{flex:1;min-width:0}
+.account-row .tt b{display:block;font-family:"Barlow Condensed",sans-serif;font-weight:600;
+  font-size:16px;text-transform:none;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.account-row .tt span{font-size:11px;color:var(--muted);font-family:"IBM Plex Mono",monospace}
+
 @media (max-width:430px){
   .sets,.strip,.last,.ex-meta,.ex-cue,.flags,.tools,.how-body,.warmup,.nudge{margin-left:0}
 }
@@ -347,6 +365,18 @@ h2,h3,h4{font-family:"Barlow Condensed",sans-serif;text-transform:uppercase;font
 </style>
 </head>
 <body>
+
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <div class="eyebrow">Loading Strip</div>
+    <h2>Sign in</h2>
+    <p>Your workouts, saved to your account instead of just this browser. One email, no password.</p>
+    <div class="field wide"><label for="gate-email">Email</label>
+      <input type="email" id="gate-email" inputmode="email" placeholder="you@example.com" autocomplete="email"></div>
+    <button class="btn" id="gate-send" style="width:100%;margin-top:12px">Send sign-in link</button>
+    <p class="gate-status" id="gate-status"></p>
+  </div>
+</div>
 
 <div class="wrap">
   <header class="masthead">
@@ -485,7 +515,20 @@ h2,h3,h4{font-family:"Barlow Condensed",sans-serif;text-transform:uppercase;font
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
+/* ==========================================================
+   CLOUD SYNC CONFIG
+   Leave both blank to run in local-only mode (data stays on
+   this device, same as before). Fill both in from your
+   Supabase project (Settings -> API) to turn on real accounts:
+   sign-in by email link, and workouts stored in the cloud so
+   clearing the browser can't erase them.
+   ========================================================== */
+const SUPABASE_URL = "";       /* e.g. "https://xxxxxxxx.supabase.co" */
+const SUPABASE_ANON_KEY = "";  /* the "anon public" key from the same page */
+const CLOUD_ON = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+const sb = CLOUD_ON && window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 const MNAME={chest:"Chest",shoulder:"Shoulders",biceps:"Biceps",forearm:"Forearms",abs:"Abs",
   obliques:"Obliques",quads:"Quads",traps:"Traps",deltrear:"Rear delts",lats:"Lats",
   midback:"Mid-back",triceps:"Triceps",lowerback:"Lower back",glutes:"Glutes",
@@ -1001,7 +1044,7 @@ const now=()=>new Date().toISOString();
 const D={sessions:[],sets:[],weights:[],swaps:[],focus:[],profile:null,meta:{}};
 
 const Store={
-  mode:"local",          /* "local" | "rest" */
+  mode:CLOUD_ON?"rest":"local",
   baseUrl:null, token:null, userId:"local-user",
   async read(k){
     if(this.mode==="rest")return this._rest("GET",k);
@@ -1028,10 +1071,113 @@ const Store={
   }
 };
 
-async function persistTraining(){await Store.write("training",{v:SCHEMA_VERSION,sessions:D.sessions,sets:D.sets});}
-async function persistWeights(){await Store.write("weights",{v:SCHEMA_VERSION,weights:D.weights});}
-async function persistConfig(){await Store.write("config",
-  {v:SCHEMA_VERSION,swaps:D.swaps,focus:D.focus,profile:D.profile,meta:D.meta});}
+async function persistTraining(){
+  if(Store.mode==="rest")return pushTraining();
+  await Store.write("training",{v:SCHEMA_VERSION,sessions:D.sessions,sets:D.sets});
+}
+async function persistWeights(){
+  if(Store.mode==="rest")return pushWeights();
+  await Store.write("weights",{v:SCHEMA_VERSION,weights:D.weights});
+}
+async function persistConfig(){
+  if(Store.mode==="rest")return pushConfig();
+  await Store.write("config",
+    {v:SCHEMA_VERSION,swaps:D.swaps,focus:D.focus,profile:D.profile,meta:D.meta});
+}
+
+/* ==========================================================
+   CLOUD SYNC — Supabase. Push-then-repull keeps local D in
+   lockstep with the server after every write; simple and
+   correct at the scale of one person's own workouts. The id
+   is omitted from upserts so Postgres keeps the row's real id
+   stable across devices instead of two clients racing to
+   "own" a row with different client-generated ids.
+   ========================================================== */
+function stripRow(r,cols){const o={};cols.forEach(c=>{if(r[c]!==undefined)o[c]=r[c];});return o;}
+
+async function pushTraining(){
+  if(!sb||!Store.userId)return;
+  const uid=Store.userId;
+  for(const s of D.sessions){
+    const row=stripRow(s,["date","program_key","day_key","unit","note","deleted"]);
+    row.user_id=uid;
+    const{data,error}=await sb.from("session").upsert(row,
+      {onConflict:"user_id,date,program_key,day_key"}).select().single();
+    if(!error&&data){
+      const oldId=s.id;
+      if(oldId!==data.id)D.sets.forEach(st=>{if(st.session_id===oldId)st.session_id=data.id;});
+      s.id=data.id; /* adopt the server's canonical id */
+    }
+  }
+  for(const st of D.sets){
+    const sess=D.sessions.find(x=>x.id===st.session_id);
+    if(!sess)continue;
+    const row=stripRow(st,["exercise_key","set_index","weight","reps","completed","deleted"]);
+    row.user_id=uid;row.session_id=sess.id;
+    await sb.from("set_log").upsert(row,{onConflict:"session_id,exercise_key,set_index"});
+  }
+}
+async function pushWeights(){
+  if(!sb||!Store.userId)return;
+  for(const w of D.weights){
+    const row=stripRow(w,["date","weight_kg","deleted"]);row.user_id=Store.userId;
+    await sb.from("bodyweight").upsert(row,{onConflict:"user_id,date"});
+  }
+}
+async function pushConfig(){
+  if(!sb||!Store.userId)return;
+  const uid=Store.userId;
+  for(const s of D.swaps){
+    const row=stripRow(s,["program_key","day_key","slot_no","exercise_key","deleted"]);row.user_id=uid;
+    await sb.from("exercise_swap").upsert(row,{onConflict:"user_id,program_key,day_key,slot_no"});
+  }
+  for(const f of D.focus){
+    const row=stripRow(f,["program_key","day_key","block_key","deleted"]);row.user_id=uid;
+    await sb.from("focus_block").upsert(row,{onConflict:"user_id,program_key,day_key,block_key"});
+  }
+  if(D.profile){
+    const row=stripRow(D.profile,["unit","program_key","goal_mode","sex","age","height_cm",
+      "weight_kg","activity","pace","guard_spine","guard_shoulder","rest_timer","deleted"]);
+    row.user_id=uid;
+    await sb.from("profile").upsert(row,{onConflict:"user_id"});
+  }
+}
+async function pullAll(){
+  if(!sb||!Store.userId)return;
+  const uid=Store.userId;
+  const[sessions,sets,weights,swaps,focus,prof]=await Promise.all([
+    sb.from("session").select("*").eq("user_id",uid),
+    sb.from("set_log").select("*").eq("user_id",uid),
+    sb.from("bodyweight").select("*").eq("user_id",uid),
+    sb.from("exercise_swap").select("*").eq("user_id",uid),
+    sb.from("focus_block").select("*").eq("user_id",uid),
+    sb.from("profile").select("*").eq("user_id",uid).maybeSingle()
+  ]);
+  D.sessions=sessions.data||[];D.sets=sets.data||[];D.weights=weights.data||[];
+  D.swaps=swaps.data||[];D.focus=focus.data||[];
+  D.profile=prof.data||null;
+}
+/* first sign-in on this account: if the server's empty but this
+   browser already has local sessions, offer them up rather than
+   silently discarding today's workout */
+async function migrateLocalToCloud(){
+  if(D.sessions.length||D.sets.length||D.weights.length)return false;
+  let t=null,w=null,c=null;
+  try{const r=localStorage.getItem(KEYS.training);if(r)t=JSON.parse(r);}catch(e){}
+  try{const r=localStorage.getItem(KEYS.weights);if(r)w=JSON.parse(r);}catch(e){}
+  try{const r=localStorage.getItem(KEYS.config);if(r)c=JSON.parse(r);}catch(e){}
+  if(!t&&!w&&!c)return false;
+  const uid=Store.userId;
+  if(t){D.sessions=(t.sessions||[]).map(s=>Object.assign({},s,{user_id:uid}));
+        D.sets=(t.sets||[]).map(s=>Object.assign({},s,{user_id:uid}));}
+  if(w)D.weights=(w.weights||[]).map(x=>Object.assign({},x,{user_id:uid}));
+  if(c){D.swaps=(c.swaps||[]).map(x=>Object.assign({},x,{user_id:uid}));
+        D.focus=(c.focus||[]).map(x=>Object.assign({},x,{user_id:uid}));
+        if(c.profile)D.profile=Object.assign({},c.profile,{user_id:uid});}
+  await pushTraining();await pushWeights();await pushConfig();
+  await pullAll(); /* re-pull so local ids match what the server assigned */
+  return true;
+}
 
 const live=a=>a.filter(r=>!r.deleted);
 function upsert(arr,match,patch){
@@ -1590,7 +1736,12 @@ function openSettings(){
   const tog=(key,title,desc)=>`<div class="toggle-row"><div class="tt"><b>${title}</b><span>${desc}</span></div>
     <button class="sw" data-tog="${key}" aria-pressed="${key==="rest_timer"?p.rest_timer!==false:!!p[key]}" aria-label="${title}"></button></div>`;
 
+  const account=CLOUD_ON?`<div class="account-row">
+      <div class="tt"><b id="acct-email">Signed in</b><span>Synced to your account</span></div>
+      <button class="btn ghost sm" id="s-signout">Sign out</button></div>`:"";
+
   box.innerHTML=`
+    ${account}
     <div class="set-group"><h5>Programme</h5><div class="opt-list">${progs}</div></div>
     <div class="set-group"><h5>Joint filters</h5>
       ${tog("guard_spine","Spare my lower back","Hides axially loaded lifts and re-picks any already in your plan.")}
@@ -1620,6 +1771,15 @@ function openSettings(){
 
   document.getElementById("s-export").onclick=()=>ioSheet("export");
   document.getElementById("s-import").onclick=()=>ioSheet("import");
+  if(CLOUD_ON){
+    sb.auth.getUser().then(({data})=>{
+      const el=document.getElementById("acct-email");
+      if(el&&data.user)el.textContent=data.user.email;
+    });
+    document.getElementById("s-signout").onclick=async()=>{
+      await sb.auth.signOut();closeSheet();
+    };
+  }
   openS();
 }
 document.getElementById("prog-chip").onclick=openSettings;
@@ -1948,23 +2108,71 @@ document.getElementById("clear").onclick=()=>{
   el.addEventListener("input",macros);el.addEventListener("change",macros);});
 document.getElementById("lift-pick").onchange=e=>{S.liftPick=e.target.value;drawLift();};
 
-async function boot(){
+async function bootLocal(){
   const t=await Store.read("training"),wts=await Store.read("weights"),cfg=await Store.read("config");
   if(t){D.sessions=t.sessions||[];D.sets=t.sets||[];}
   if(wts)D.weights=wts.weights||[];
   if(cfg){D.swaps=cfg.swaps||[];D.focus=cfg.focus||[];D.profile=cfg.profile||null;D.meta=cfg.meta||{};}
-
   if(!t&&!wts&&!cfg){
     const did=await migrateV4();
     if(did)setStatus("Upgraded your data to the new format");
   }
+  finishBoot();
+}
+async function bootCloud(){
+  Store.userId=(await sb.auth.getUser()).data.user.id;
+  await pullAll();
+  if(!D.sessions.length&&!D.sets.length&&!D.weights.length){
+    const moved=await migrateLocalToCloud();
+    if(moved)setStatus("Moved this device's history into your account");
+  }
+  if(!D.profile){
+    D.profile=blankProfile();D.profile.user_id=Store.userId;
+    await pushConfig();
+  }
+  finishBoot();
+}
+function finishBoot(){
   if(!D.profile)D.profile=blankProfile();
   if(!PROGRAMS[D.profile.program_key])D.profile.program_key="advanced";
   S.day=dayKeys()[0];
-
   applyProfileToForm();syncUnitUI();syncModeUI();
   loadSession();render();drawBW();buildLiftPicker();macros();syncNote();
-  if(!document.getElementById("status").textContent.startsWith("Upgraded"))setStatus("Ready");
+  if(!document.getElementById("status").textContent.startsWith("Upgraded")&&
+     !document.getElementById("status").textContent.startsWith("Moved"))setStatus("Ready");
+}
+
+function showGate(msg){
+  document.body.classList.add("gated");
+  document.getElementById("gate").classList.add("on");
+  if(msg)document.getElementById("gate-status").textContent=msg;
+}
+function hideGate(){
+  document.body.classList.remove("gated");
+  document.getElementById("gate").classList.remove("on");
+}
+document.getElementById("gate-send").onclick=async()=>{
+  const email=document.getElementById("gate-email").value.trim();
+  const status=document.getElementById("gate-status");
+  status.className="gate-status";
+  if(!email||!email.includes("@")){status.className="gate-status err";status.textContent="Enter a valid email.";return;}
+  status.textContent="Sending\u2026";
+  try{
+    const{error}=await sb.auth.signInWithOtp({email,options:{emailRedirectTo:window.location.href}});
+    if(error){status.className="gate-status err";status.textContent=error.message;return;}
+    status.textContent="Check "+email+" for a sign-in link.";
+  }catch(e){status.className="gate-status err";status.textContent="Couldn't reach the server \u2014 try again.";}
+};
+
+async function boot(){
+  if(!CLOUD_ON){await bootLocal();return;}
+  if(!sb){showGate("Cloud sync is misconfigured \u2014 check the Supabase keys.");return;}
+  sb.auth.onAuthStateChange((event,session)=>{
+    if(session){hideGate();if(!S._booted){S._booted=true;bootCloud();}}
+    else{S._booted=false;showGate();}
+  });
+  const{data}=await sb.auth.getSession();
+  if(!data.session)showGate();
 }
 boot();
 </script>
