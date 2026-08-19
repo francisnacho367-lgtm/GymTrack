@@ -3141,20 +3141,32 @@ async function finishSession(){
 document.getElementById("clear").onclick=()=>{
   const typed=Object.values(S.cur).some(a=>a.some(x=>x.w||x.r||x.done))||
     !!document.getElementById("note").value.trim();
-  const wipe=()=>{
-    clearTimeout(autosaveTimer); /* a pending autosave must not resurrect and persist the empty state */
+  const saved=findSession(S.date,progKey(),S.day);
+  if(!typed&&!saved){setStatus("Nothing to clear");return;}
+  /* Autosave means anything typed is usually already saved by the time Clear
+     is tapped, so a "clear the screen but leave the saved copy alone" reset
+     would just reappear on the next reload \u2014 confusing, and not what
+     "clear" means to someone looking at it. Clear now actually deletes the
+     saved session and its sets, not just the on-screen view. */
+  const setCount=saved?live(D.sets).filter(x=>x.session_id===saved.id).length:0;
+  const detail=setCount?` \u2014 ${setCount} logged set${setCount>1?"s":""} will be permanently deleted.`
+                       :" Nothing has been saved yet, so this just clears the screen.";
+  const wipe=async()=>{
+    clearTimeout(autosaveTimer); /* a pending autosave must not resurrect what's being deleted */
+    if(saved){
+      tombstone(D.sessions,x=>x.id===saved.id);
+      tombstone(D.sets,x=>x.session_id===saved.id);
+      S._logCache=null;S._calCache=null;
+      await persistTraining();
+    }
     S.cur={};document.getElementById("note").value="";
     clearSessionClock();paintSaveState();
-    render();setStatus("Cleared \u2014 not yet saved");
+    render();setStatus(setCount?"Session deleted":"Cleared");
   };
-  if(!typed){setStatus("Nothing to clear");return;}
-  const saved=findSession(S.date,progKey(),S.day);
-  confirmSheet("Clear this session?",
-    "Every weight, rep and note you've typed for "+days()[S.day].name+" on "+S.date+
-    " will be wiped, and the session clock resets."+
-    (saved?" Your last saved version stays in your history until you save again."
-          :" Nothing has been saved yet, so this can't be undone."),
-    "Clear it",wipe,true);
+  confirmSheet("Delete this session?",
+    "This removes everything logged for "+days()[S.day].name+" on "+S.date+"."+detail+
+    (setCount?" This can't be undone.":""),
+    setCount?"Delete it":"Clear it",wipe,true);
 };
 ["sex","age","ft","in","cm","wt","act","pace"].forEach(id=>{
   const el=document.getElementById(id);
