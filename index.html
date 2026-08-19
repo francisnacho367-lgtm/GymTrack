@@ -197,6 +197,17 @@ h2,h3,h4{font-family:"Barlow Condensed",sans-serif;text-transform:uppercase;font
 .appnav button:hover{color:var(--muted)}
 .appnav button[aria-current="true"]{color:var(--beat)}
 
+/* ---------- autosave state ---------- */
+.save-state{margin-top:9px;font-family:"IBM Plex Mono",monospace;font-size:10.5px;
+  letter-spacing:.05em;color:var(--dim);min-height:14px;transition:color .2s}
+.save-state.pending{color:#B08A2E}
+.save-state.saving{color:var(--muted)}
+.save-state.saved{color:var(--ok)}
+.sb-save{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.05em;
+  color:var(--dim);white-space:nowrap}
+.sb-save.saved{color:var(--ok)}
+.sb-save.pending{color:#B08A2E}
+
 /* ---------- session bar ---------- */
 .sessbar{display:flex;align-items:center;gap:13px;background:var(--surface);
   border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px;margin-bottom:18px}
@@ -585,6 +596,7 @@ body.gated .wrap,body.gated .appnav,body.gated .timer{display:none}
       <div class="sb-meta"><b id="sb-title">Not started</b><span id="sb-sub">The clock runs until you hit Finish.</span></div>
     </div>
     <button class="btn sm" id="sb-start">Start</button>
+    <div class="sb-save" id="sb-save"></div>
   </div>
 
   <main id="session"></main>
@@ -596,6 +608,7 @@ body.gated .wrap,body.gated .appnav,body.gated .timer{display:none}
   </div>
 
   <textarea class="session-note" id="note" placeholder="Session notes — sleep, energy, any joint that spoke up, cues that worked."></textarea>
+  <div class="save-state" id="save-state"></div>
 
   <div class="actions">
     <div class="act-row">
@@ -1742,8 +1755,47 @@ function loadSession(){
   }
   document.getElementById("note").value=s?(s.note||""):"";
 }
-async function saveSession(){
-  setStatus("Saving\u2026");
+/* ---------- autosave ----------
+   Typed values only ever lived in memory until an explicit Save/Finish tap —
+   switching days or the date field discarded anything unsaved, and the tap
+   itself was easy to miss once the buttons moved out of the fixed toolbar.
+   Autosave removes the need to remember: every edit schedules a quiet write
+   a moment later, and anything that changes context (day, date) flushes
+   immediately first so nothing is ever silently dropped. */
+let autosaveTimer=null,savingNow=false;
+function scheduleAutosave(){
+  clearTimeout(autosaveTimer);
+  paintSaveState("pending");
+  autosaveTimer=setTimeout(()=>{saveSession(true);},900);
+}
+async function flushAutosave(){
+  clearTimeout(autosaveTimer);
+  const dirty=Object.values(S.cur).some(a=>a.some(x=>x.w||x.r||x.done))||
+    document.getElementById("note").value.trim();
+  if(dirty)await saveSession(true);
+}
+function paintSaveState(mode){
+  const el=document.getElementById("save-state"),sb=document.getElementById("sb-save");
+  const stamp=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  let txt="",cls="save-state",sbTxt="",sbCls="sb-save";
+  if(mode==="pending"){txt="Unsaved changes\u2026";cls+=" pending";sbTxt="\u25cf unsaved";sbCls+=" pending";}
+  else if(mode==="saving"){txt="Saving\u2026";cls+=" saving";sbTxt="saving\u2026";}
+  else if(mode==="saved"){txt="Saved "+stamp;cls+=" saved";sbTxt="\u2713 saved "+stamp;sbCls+=" saved";}
+  if(el){el.textContent=txt;el.className=cls;}
+  if(sb){sb.textContent=sbTxt;sb.className=sbCls;}
+}
+window.addEventListener("beforeunload",()=>{
+  if(autosaveTimer){clearInterval(autosaveTimer);/* best-effort only — a synchronous
+    localStorage write still lands, a cloud request in flight may not */}
+});
+document.addEventListener("visibilitychange",()=>{if(document.hidden)flushAutosave();});
+
+async function saveSession(silent){
+  if(savingNow){scheduleAutosave();return;} /* a save is already in flight — try again shortly */
+  clearTimeout(autosaveTimer);
+  savingNow=true;
+  if(!silent)setStatus("Saving\u2026");
+  paintSaveState("saving");
   const sess=upsert(D.sessions,s=>s.date===S.date&&s.program_key===progKey()&&s.day_key===S.day,
     {date:S.date,program_key:progKey(),day_key:S.day,unit:unit(),note:v("note")});
   tombstone(D.sets,x=>x.session_id===sess.id);
@@ -1758,7 +1810,9 @@ async function saveSession(){
   D.sets=D.sets.filter(x=>!(x.deleted&&x.session_id===sess.id));
   S._logCache=null;S._calCache=null;
   await persistTraining();
-  setStatus("Saved "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}));
+  savingNow=false;
+  paintSaveState("saved");
+  if(!silent)setStatus("Saved "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}));
   render();buildLiftPicker();syncNote();
 }
 
@@ -1962,12 +2016,13 @@ function exerciseEl(sl,i){
       <input class="f-r" type="number" inputmode="numeric" placeholder="${prev?esc(prev.r):"reps"}" value="${esc(st.r)}" aria-label="Set ${j+1} reps">
       <button class="done" aria-pressed="${st.done}" aria-label="Mark set ${j+1} complete">\u2713</button>`;
     const[wIn,rIn]=row.querySelectorAll("input"),btn=row.querySelector(".done");
-    wIn.oninput=()=>{st.w=wIn.value;ensureSessionStarted();drawStrips();beat(row,st,prev);checkPR(id,st,row);tally();
+    wIn.oninput=()=>{st.w=wIn.value;ensureSessionStarted();drawStrips();beat(row,st,prev);checkPR(id,st,row);tally();scheduleAutosave();
       if(wu.style.display!=="none")renderWarmup(wu,id,S.cur[id]);};
-    rIn.oninput=()=>{st.r=rIn.value;ensureSessionStarted();beat(row,st,prev);checkPR(id,st,row);tally();};
+    rIn.oninput=()=>{st.r=rIn.value;ensureSessionStarted();beat(row,st,prev);checkPR(id,st,row);tally();scheduleAutosave();};
     btn.onclick=()=>{st.done=!st.done;btn.setAttribute("aria-pressed",st.done);
       ensureSessionStarted();
-      if(st.done){checkPR(id,st,row);if(P().rest_timer)startTimer(sl.rest,ex.n,j+1,sl.s);}};
+      if(st.done){checkPR(id,st,row);if(P().rest_timer)startTimer(sl.rest,ex.n,j+1,sl.s);}
+      scheduleAutosave();};
     beat(row,st,prev);checkPR(id,st,row);wrap.appendChild(row);
   });
   el.appendChild(wrap);
@@ -2996,6 +3051,7 @@ document.getElementById("bw-date").value=S.date;
 document.getElementById("date").onchange=e=>{S.date=e.target.value;loadSession();render();};
 document.getElementById("save").onclick=saveSession;
 document.getElementById("finish").onclick=finishSession;
+document.getElementById("note").oninput=()=>{ensureSessionStarted();scheduleAutosave();};
 document.getElementById("add-exercise").onclick=openAddExercise;
 document.getElementById("sb-start").onclick=()=>{ensureSessionStarted();setStatus("Session started");};
 document.querySelectorAll("#appnav button").forEach(b=>{
@@ -3086,8 +3142,9 @@ document.getElementById("clear").onclick=()=>{
   const typed=Object.values(S.cur).some(a=>a.some(x=>x.w||x.r||x.done))||
     !!document.getElementById("note").value.trim();
   const wipe=()=>{
+    clearTimeout(autosaveTimer); /* a pending autosave must not resurrect and persist the empty state */
     S.cur={};document.getElementById("note").value="";
-    clearSessionClock();
+    clearSessionClock();paintSaveState();
     render();setStatus("Cleared \u2014 not yet saved");
   };
   if(!typed){setStatus("Nothing to clear");return;}
