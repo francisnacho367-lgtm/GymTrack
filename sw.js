@@ -1,4 +1,4 @@
-/* Loading Strip — minimal service worker.
+/* Rakk — minimal service worker.
    Its only job is to give the page a registration that can show notifications
    while the app is backgrounded (registration.showNotification), and to focus
    the app when one is tapped. No caching: the app is a single HTML file and
